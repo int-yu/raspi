@@ -1,0 +1,13 @@
+# Keep vendor documents and very large image downloads local unless explicitly needed.
+/资料/
+/安装教程.pdf
+
+# Runtime/generated files
+__pycache__/
+*.pyc
+*.log
+*.bak
+*.tmp
+*.downloading
+.ssh/
+.ssh_known_hosts
