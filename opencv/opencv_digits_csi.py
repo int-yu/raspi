@@ -83,6 +83,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-area", type=int, default=80, help="Minimum contour area.")
     parser.add_argument("--max-distance", type=float, default=0.30, help="Reject KNN matches above this distance.")
+    parser.add_argument(
+        "--target-confidence-weight",
+        type=float,
+        default=0.35,
+        help=(
+            "How much classifier confidence affects the single displayed target. "
+            "The target is primarily chosen by distance to screen center; lower KNN distance means higher confidence."
+        ),
+    )
     parser.add_argument("--k", type=int, default=3, help="KNN neighbor count.")
     parser.add_argument(
         "--roi",
@@ -387,43 +396,107 @@ def detect_digits(
     return detections, binary
 
 
-def draw_results(frame_bgr: np.ndarray, detections: list[Detection], roi: tuple[int, int, int, int] | None) -> None:
+def center_offset(det: Detection, frame_shape: tuple[int, ...]) -> tuple[int, int, float]:
+    frame_h, frame_w = frame_shape[:2]
+    target_x = det.x + det.w / 2.0
+    target_y = det.y + det.h / 2.0
+    dx = int(round(target_x - frame_w / 2.0))
+    dy = int(round(target_y - frame_h / 2.0))
+    center_distance = float(np.hypot(dx, dy))
+    return dx, dy, center_distance
+
+
+def target_detection(
+    detections: list[Detection],
+    frame_shape: tuple[int, ...],
+    args: argparse.Namespace,
+) -> Detection | None:
+    if not detections:
+        return None
+
+    frame_h, frame_w = frame_shape[:2]
+    half_diag = max(1.0, float(np.hypot(frame_w / 2.0, frame_h / 2.0)))
+    max_distance = max(1e-6, float(args.max_distance))
+    confidence_weight = max(0.0, float(args.target_confidence_weight))
+
+    def score(det: Detection) -> tuple[float, float, float]:
+        _, _, center_distance = center_offset(det, frame_shape)
+        center_score = center_distance / half_diag
+        confidence_score = det.distance / max_distance
+        return (center_score + confidence_weight * confidence_score, center_score, det.distance)
+
+    return min(detections, key=score)
+
+
+def draw_results(
+    frame_bgr: np.ndarray,
+    target: Detection | None,
+    roi: tuple[int, int, int, int] | None,
+    fps: float | None = None,
+) -> None:
     if roi:
         rx, ry, rw, rh = roi
         cv2.rectangle(frame_bgr, (rx, ry), (rx + rw, ry + rh), (255, 180, 0), 2)
 
-    for det in detections:
-        cv2.rectangle(frame_bgr, (det.x, det.y), (det.x + det.w, det.y + det.h), (0, 255, 0), 2)
-        label = f"{det.digit} d={det.distance:.2f}"
-        y = max(18, det.y - 8)
-        cv2.putText(
-            frame_bgr,
-            label,
-            (det.x, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
+    frame_h, frame_w = frame_bgr.shape[:2]
+    cv2.drawMarker(
+        frame_bgr,
+        (frame_w // 2, frame_h // 2),
+        (0, 180, 255),
+        cv2.MARKER_CROSS,
+        24,
+        2,
+        cv2.LINE_AA,
+    )
 
-    digits = "".join(det.digit for det in detections)
+    fps_text = f"FPS: {fps:.1f}" if fps is not None and fps > 0 else "FPS: -"
     cv2.putText(
         frame_bgr,
-        f"Digits: {digits or '-'}",
-        (12, 30),
+        fps_text,
+        (12, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
+        0.75,
         (0, 180, 255),
         2,
         cv2.LINE_AA,
     )
 
+    if target is None:
+        cv2.putText(
+            frame_bgr,
+            "-",
+            (12, 96),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            2.0,
+            (0, 0, 255),
+            4,
+            cv2.LINE_AA,
+        )
+        return
 
-def best_detection(detections: list[Detection]) -> Detection | None:
-    if not detections:
-        return None
-    return min(detections, key=lambda det: det.distance)
+    cv2.rectangle(frame_bgr, (target.x, target.y), (target.x + target.w, target.y + target.h), (0, 255, 0), 3)
+    cv2.putText(
+        frame_bgr,
+        target.digit,
+        (12, 96),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        2.2,
+        (0, 255, 0),
+        5,
+        cv2.LINE_AA,
+    )
+
+    label_y = max(24, target.y - 10)
+    cv2.putText(
+        frame_bgr,
+        target.digit,
+        (target.x, label_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
 
 
 class SerialOutput:
@@ -454,7 +527,7 @@ class SerialOutput:
         if self.port is not None:
             self.port.close()
 
-    def maybe_send(self, detections: list[Detection], frame_shape: tuple[int, ...]) -> None:
+    def maybe_send(self, target: Detection | None, frame_shape: tuple[int, ...]) -> None:
         if not self.enabled or self.port is None:
             return
 
@@ -462,18 +535,13 @@ class SerialOutput:
         if now - self.last_sent_at < self.interval:
             return
 
-        frame_h, frame_w = frame_shape[:2]
-        best = best_detection(detections)
-        if best is None:
+        if target is None:
             if not self.send_empty:
                 return
             digit, dx, dy = -1, 0, 0
         else:
-            target_x = best.x + best.w / 2.0
-            target_y = best.y + best.h / 2.0
-            digit = int(best.digit)
-            dx = int(round(target_x - frame_w / 2.0))
-            dy = int(round(target_y - frame_h / 2.0))
+            digit = int(target.digit)
+            dx, dy, _ = center_offset(target, frame_shape)
             if self.invert_y:
                 dy = -dy
 
@@ -520,17 +588,19 @@ class FramebufferDisplay:
         self.handle.write(payload)
 
 
-def print_digits(detections: list[Detection], last_printed: str) -> str:
-    digits = "".join(det.digit for det in detections)
-    if digits and digits != last_printed:
-        best = best_detection(detections)
-        detail = ", ".join(f"{d.digit}@({d.x},{d.y},{d.w},{d.h}) d={d.distance:.2f}" for d in detections)
-        if best is not None:
-            detail += f" | best={best.digit} d={best.distance:.2f}"
-        print(f"[{time.strftime('%H:%M:%S')}] digits: {digits} | {detail}", flush=True)
-        return digits
-    if not digits:
+def print_target(target: Detection | None, frame_shape: tuple[int, ...], last_printed: str) -> str:
+    if target is None:
         return ""
+
+    dx, dy, center_distance = center_offset(target, frame_shape)
+    status = f"{target.digit}:{dx}:{dy}:{target.distance:.2f}"
+    if status != last_printed:
+        print(
+            f"[{time.strftime('%H:%M:%S')}] target: {target.digit} "
+            f"dx={dx} dy={dy} center={center_distance:.1f}px distance={target.distance:.2f}",
+            flush=True,
+        )
+        return status
     return last_printed
 
 
@@ -542,8 +612,9 @@ def process_image(path: str, knn: cv2.ml_KNearest, hog: cv2.HOGDescriptor, args:
 
     roi = parse_roi(args.roi)
     detections, binary = detect_digits(frame, knn, hog, args, roi)
-    draw_results(frame, detections, roi)
-    print_digits(detections, "")
+    target = target_detection(detections, frame.shape, args)
+    draw_results(frame, target, roi)
+    print_target(target, frame.shape, "")
 
     out_path = Path(path).with_name(Path(path).stem + "_opencv_digits.jpg")
     cv2.imwrite(str(out_path), frame)
@@ -569,6 +640,8 @@ def run_camera(knn: cv2.ml_KNearest, hog: cv2.HOGDescriptor, args: argparse.Name
     time.sleep(1.2)
 
     started_at = time.monotonic()
+    last_frame_at = started_at
+    fps_ema: float | None = None
     last_printed = ""
     binary = np.zeros((args.height, args.width), dtype=np.uint8)
 
@@ -581,11 +654,19 @@ def run_camera(knn: cv2.ml_KNearest, hog: cv2.HOGDescriptor, args: argparse.Name
     try:
         while True:
             frame_rgb = picam2.capture_array()
+            now = time.monotonic()
+            frame_dt = now - last_frame_at
+            last_frame_at = now
+            if frame_dt > 0:
+                instant_fps = 1.0 / frame_dt
+                fps_ema = instant_fps if fps_ema is None else (0.85 * fps_ema + 0.15 * instant_fps)
+
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             detections, binary = detect_digits(frame_bgr, knn, hog, args, roi)
-            last_printed = print_digits(detections, last_printed)
-            serial_output.maybe_send(detections, frame_bgr.shape)
-            draw_results(frame_bgr, detections, roi)
+            target = target_detection(detections, frame_bgr.shape, args)
+            last_printed = print_target(target, frame_bgr.shape, last_printed)
+            serial_output.maybe_send(target, frame_bgr.shape)
+            draw_results(frame_bgr, target, roi, fps_ema)
             if fb_display is not None:
                 fb_display.show(frame_bgr)
 
